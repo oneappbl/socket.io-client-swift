@@ -158,6 +158,15 @@ open class WebSocket : NSObject, StreamDelegate {
     /// The shared processing queue used for all WebSocket.
     private static let sharedWorkQueue = DispatchQueue(label: "com.vluxe.starscream.websocket", attributes: [])
     
+    // proxy support
+    private var socksProxyHost: String?
+    private var socksProxyPort: Int?
+    private var socksProxyUsername: String?
+    private var socksProxyPassword: String?
+    private var httpProxyHost: String?
+    private var httpProxyPort = 80
+    private var connectingToProxy = false
+
     /// Used for setting protocols.
     public init(url: URL, protocols: [String]? = nil) {
         self.url = url
@@ -184,7 +193,7 @@ open class WebSocket : NSObject, StreamDelegate {
         guard !isConnecting else { return }
         didDisconnect = false
         isConnecting = true
-        createHTTPRequest()
+        configureProxy()
     }
     
     /**
@@ -273,7 +282,8 @@ open class WebSocket : NSObject, StreamDelegate {
         }
         if let cfHTTPMessage = CFHTTPMessageCopySerializedMessage(urlRequest) {
             let serializedRequest = cfHTTPMessage.takeRetainedValue()
-            initStreamsWithData(serializedRequest as Data, Int(port!))
+            initStreams()
+            let _ = serializedRequest
         }
     }
     
@@ -298,27 +308,15 @@ open class WebSocket : NSObject, StreamDelegate {
         let baseKey = data?.base64EncodedString(options: NSData.Base64EncodingOptions(rawValue: 0))
         return baseKey!
     }
-    
-    /**
-     Start the stream connection and write the data to the output stream.
-     */
-    private func initStreamsWithData(_ data: Data, _ port: Int) {
-        //higher level API we will cut over to at some point
-        //NSStream.getStreamsToHostWithName(url.host, port: url.port.integerValue, inputStream: &inputStream, outputStream: &outputStream)
-        // Disconnect and clean up any existing streams before setting up a new pair
-        disconnectStream(nil, runDelegate: false)
-        
-        var readStream: Unmanaged<CFReadStream>?
-        var writeStream: Unmanaged<CFWriteStream>?
-        let h = url.host! as NSString
-        CFStreamCreatePairWithSocketToHost(nil, h, UInt32(port), &readStream, &writeStream)
-        inputStream = readStream!.takeRetainedValue()
-        outputStream = writeStream!.takeRetainedValue()
+
+    private func updateSecureStreamOptions() {
         guard let inStream = inputStream, let outStream = outputStream else { return }
-        inStream.delegate = self
-        outStream.delegate = self
         if supportedSSLSchemes.contains(url.scheme!) {
             certValidated = false
+            if httpProxyHost != nil {
+                // Must set the real peer name before turning on SSL
+                outStream.setProperty(url.host, forKey:Stream.PropertyKey("_kCFStreamPropertySocketPeerName"))
+            }
             inStream.setProperty(StreamSocketSecurityLevel.negotiatedSSL as AnyObject, forKey: Stream.PropertyKey.socketSecurityLevelKey)
             outStream.setProperty(StreamSocketSecurityLevel.negotiatedSSL as AnyObject, forKey: Stream.PropertyKey.socketSecurityLevelKey)
             if disableSSLCertValidation {
@@ -346,6 +344,63 @@ open class WebSocket : NSObject, StreamDelegate {
         } else {
             certValidated = true //not a https session, so no need to check SSL pinning
         }
+    }
+
+    private func initStreams() {
+        //higher level API we will cut over to at some point
+        //NSStream.getStreamsToHostWithName(url.host, port: url.port.integerValue, inputStream: &inputStream, outputStream: &outputStream)
+
+        // Disconnect and clean up any existing streams before setting up a new pair
+        disconnectStream(nil, runDelegate: false)
+
+        var readStream: Unmanaged<CFReadStream>?
+        var writeStream: Unmanaged<CFWriteStream>?
+
+        var serverHost: String
+        var serverPort: UInt32
+
+        if let pHost = httpProxyHost {
+            connectingToProxy = true
+            serverHost = pHost
+            serverPort = UInt32(httpProxyPort)
+            //print("using httpProxyHost \(serverHost):\(serverPort)")
+        } else {
+            connectingToProxy = false
+            serverHost = url.host!
+            if let port = url.port {
+                serverPort = UInt32(port)
+            } else {
+                if let scheme = url.scheme, supportedSSLSchemes.contains(scheme) {
+                    serverPort = 443
+                } else {
+                    serverPort = 80
+                }
+            }
+        }
+        CFStreamCreatePairWithSocketToHost(nil, serverHost as CFString, serverPort, &readStream, &writeStream)
+        inputStream = readStream!.takeRetainedValue()
+        outputStream = writeStream!.takeRetainedValue()
+        guard let inStream = inputStream, let outStream = outputStream else { return }
+        inStream.delegate = self
+        outStream.delegate = self
+
+        if let sProxy = socksProxyHost  {
+            //print("ProxyConnect using socks proxy server \(sProxy):\(socksProxyPort) user \(socksProxyUsername) password \(socksProxyPassword)")
+            let settings = NSMutableDictionary(capacity:4)
+            settings[StreamSOCKSProxyConfiguration.hostKey] = sProxy
+            if let sPort = socksProxyPort {
+                settings[StreamSOCKSProxyConfiguration.portKey] = sPort
+            }
+            if let sName = socksProxyUsername {
+                settings[StreamSOCKSProxyConfiguration.userKey] = sName
+            }
+            if let sPass = socksProxyPassword {
+                settings[StreamSOCKSProxyConfiguration.passwordKey] = sPass;
+            }
+            inputStream!.setProperty(settings, forKey:Stream.PropertyKey.socksProxyConfigurationKey)
+            outputStream!.setProperty(settings, forKey:Stream.PropertyKey.socksProxyConfigurationKey)
+        }
+
         if voipEnabled {
             inStream.setProperty(StreamNetworkServiceTypeValue.voIP as AnyObject, forKey: Stream.PropertyKey.networkServiceType)
             outStream.setProperty(StreamNetworkServiceTypeValue.voIP as AnyObject, forKey: Stream.PropertyKey.networkServiceType)
@@ -359,50 +414,22 @@ open class WebSocket : NSObject, StreamDelegate {
         self.mutex.lock()
         self.readyToWrite = true
         self.mutex.unlock()
-        
-        let bytes = UnsafeRawPointer((data as NSData).bytes).assumingMemoryBound(to: UInt8.self)
-        var out = timeout * 1_000_000 // wait 5 seconds before giving up
-        let operation = BlockOperation()
-        operation.addExecutionBlock { [weak self, weak operation] in
-            guard let sOperation = operation else { return }
-            while !outStream.hasSpaceAvailable && !sOperation.isCancelled {
-                usleep(100) // wait until the socket is ready
-                guard !sOperation.isCancelled else { return }
-                out -= 100
-                if out < 0 {
-                    WebSocket.sharedWorkQueue.async {
-                        self?.cleanupStream()
-                    }
-                    self?.doDisconnect(self?.errorWithDetail("write wait timed out", code: 2))
-                    return
-                } else if outStream.streamError != nil {
-                    return // disconnectStream will be called.
-                }
-            }
-            guard !sOperation.isCancelled, let s = self else { return }
-            // Do the pinning now if needed
-            if let sec = s.security, !s.certValidated {
-                let trust = outStream.property(forKey: kCFStreamPropertySSLPeerTrust as Stream.PropertyKey) as! SecTrust
-                let domain = outStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as? String
-                s.certValidated = sec.isValid(trust, domain: domain)
-                if !s.certValidated {
-                    WebSocket.sharedWorkQueue.async {
-                        let error = s.errorWithDetail("Invalid SSL certificate", code: 1)
-                        s.disconnectStream(error)
-                    }
-                    return
-                }
-            }
-            outStream.write(bytes, maxLength: data.count)
-        }
-        writeQueue.addOperation(operation)
+
     }
     
     /**
      Delegate for the stream methods. Processes incoming bytes
      */
     open func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
-        if eventCode == .hasBytesAvailable {
+        if eventCode == .openCompleted {
+            if aStream == inputStream && !isConnected {
+                if httpProxyHost != nil {
+                    proxyDidConnect();
+                } else {
+                    didConnect()
+                }
+            }
+        } else if eventCode == .hasBytesAvailable {
             if aStream == inputStream {
                 processInputStream()
             }
@@ -483,7 +510,11 @@ open class WebSocket : NSObject, StreamDelegate {
                 let buffer = UnsafeRawPointer((work as NSData).bytes).assumingMemoryBound(to: UInt8.self)
                 let length = work.count
                 if !connected {
-                    processTCPHandshake(buffer, bufferLen: length)
+                    if connectingToProxy {
+                        proxyProcessHTTPResponse(buffer: buffer, bufferLen: length)
+                    } else {
+                        processTCPHandshake(buffer, bufferLen: length)
+                    }
                 } else {
                     processRawMessagesInBuffer(buffer, bufferLen: length)
                 }
@@ -933,7 +964,337 @@ open class WebSocket : NSObject, StreamDelegate {
         cleanupStream()
         writeQueue.cancelAllOperations()
     }
-    
+
+    // MARK: - Proxy suport
+
+    /**
+     Get proxy setting from device setting
+     */
+    private func configureProxy () {
+        let proxyUrl = getProxyUrl(fromUrl: url)
+        guard let proxySettings: NSDictionary = CFNetworkCopySystemProxySettings()?.takeRetainedValue() else {
+            // no proxy setting
+            openConnection()
+            return
+        }
+
+        let proxies: NSArray = CFNetworkCopyProxiesForURL(proxyUrl as CFURL, proxySettings).takeRetainedValue()
+        guard proxies.count > 0 else {
+            openConnection()
+            return
+        }
+
+        if let settings = proxies[0] as? NSDictionary,
+            let proxyType = settings[(kCFProxyTypeKey as NSString)] as? NSString {
+            switch (proxyType) {
+            case kCFProxyTypeAutoConfigurationURL:
+                if let pacURL: NSURL = settings[(kCFProxyAutoConfigurationURLKey as NSString)] as? NSURL {
+                    fetchPAC(PACurl: pacURL as URL)
+                    return
+                }
+            case kCFProxyTypeAutoConfigurationJavaScript:
+                if let script: NSString = settings[(kCFProxyAutoConfigurationJavaScriptKey as NSString)] as? NSString {
+                    runPACScript(script: script as String);
+                    return;
+                }
+            default:
+                readProxySetting(proxyType: proxyType, settings: settings)
+            }
+        }
+        openConnection()
+    }
+
+    private func readProxySetting(proxyType: NSString, settings: NSDictionary ){
+        switch (proxyType) {
+        case kCFProxyTypeHTTP, kCFProxyTypeHTTPS:
+            httpProxyHost = settings[(kCFProxyHostNameKey as NSString)] as? String
+            if let portValue = settings[(kCFProxyPortNumberKey as NSString)] as? NSNumber {
+                httpProxyPort = portValue.intValue
+            }
+
+        case kCFProxyTypeSOCKS:
+            socksProxyHost = settings[(kCFProxyHostNameKey as NSString)] as? String
+            if let portValue = settings[(kCFProxyPortNumberKey as NSString)] as? NSNumber {
+                socksProxyPort = portValue.intValue
+            }
+            socksProxyUsername = settings[(kCFProxyUsernameKey as NSString)] as? String
+            socksProxyPassword = settings[(kCFProxyPasswordKey as NSString)] as? String
+        default: break
+        }
+    }
+
+
+    private func fetchPAC(PACurl: URL) {
+        if PACurl.isFileURL {
+            do {
+                var encoding = String.Encoding.utf8
+                let script = try String(contentsOf: PACurl, usedEncoding: &encoding)
+                runPACScript(script: script)
+            } catch {
+                openConnection()
+            }
+            return;
+        }
+
+        guard let scheme = PACurl.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            // Don't know how to read data from this URL, we'll have to give up
+            // We'll simply assume no proxies, and start the request as normal
+            openConnection()
+            return
+        }
+
+        let request = URLRequest(url: PACurl)
+        let task = URLSession.shared.dataTask(with: request) { [weak self] (data: Data?, _: URLResponse?, _: Error?) in
+            guard let s = self else { return }
+            guard let data = data, let script = String(data: data, encoding: .utf8) else {
+                s.openConnection()
+                return
+            }
+            s.runPACScript(script: script)
+        }
+        task.resume()
+    }
+
+    private func runPACScript(script: String) {
+        // From: http://developer.apple.com/samplecode/CFProxySupportTool/listing1.html
+        // Work around <rdar://problem/5530166>.  This dummy call to
+        // CFNetworkCopyProxiesForURL initialise some state within CFNetwork
+        // that is required by CFNetworkCopyProxiesForAutoConfigurationScript.
+        let empty = NSDictionary()
+        let _ = CFNetworkCopyProxiesForURL(url as CFURL, empty).takeRetainedValue()
+
+        // Obtain the list of proxies by running the autoconfiguration script
+
+        // CFNetworkCopyProxiesForAutoConfigurationScript doesn't understand ws:// or wss://
+        let proxyUrl = getProxyUrl(fromUrl: url)
+        var error: Unmanaged<CFError>?
+        guard let proxies: NSArray = CFNetworkCopyProxiesForAutoConfigurationScript(script as CFString, proxyUrl as CFURL, &error)?.takeRetainedValue() else {
+            openConnection()
+            return
+        }
+        guard error == nil else {
+            openConnection()
+            return
+        }
+        guard proxies.count > 0 else {
+            openConnection()
+            return
+        }
+        let settings = proxies[0] as! NSDictionary
+        if let proxyType: NSString = settings[(kCFProxyTypeKey as NSString)] as? NSString {
+            readProxySetting(proxyType: proxyType, settings: settings)
+        }
+        openConnection()
+    }
+
+    /**
+     Get url suitable for proxy configuration (the proxy config doesn't understand "wss" or "ws" protocols)
+     */
+    private func getProxyUrl(fromUrl url: URL) -> URL {
+        var proxyUrl: URL? = nil
+        if let host = url.host {
+            if let scheme = url.scheme, supportedSSLSchemes.contains(scheme) {
+                proxyUrl = URL(string: "https://"+host)
+            } else {
+                proxyUrl = URL(string: "http://"+host)
+            }
+        }
+        return proxyUrl ?? url
+    }
+
+    // private method to open network connection
+    private func openConnection() {
+        initStreams()
+        isConnecting = false
+    }
+
+    // proxy server connected
+    private func proxyDidConnect() {
+        let h = url.host! as NSString
+        var port = url.port
+        if port == nil {
+            if let scheme = url.scheme, supportedSSLSchemes.contains(scheme) {
+                port = 443
+            } else {
+                port = 80
+            }
+        }
+        // Send HTTP CONNECT Request
+        let connectRequestStr = "CONNECT \(h):\(port!) HTTP/1.1\r\nHost: \(h)\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n"
+
+        if let data = connectRequestStr.data(using: .utf8) {
+            let bytes = UnsafeRawPointer((data as NSData).bytes).assumingMemoryBound(to: UInt8.self)
+            var out = timeout * 1_000_000 // wait 5 seconds before giving up
+            let operation = BlockOperation()
+            operation.addExecutionBlock { [weak self, weak operation] in
+                guard let sOperation = operation else { return }
+                guard let s = self else { return }
+                guard let outStream = s.outputStream else { return }
+                while !outStream.hasSpaceAvailable && !sOperation.isCancelled {
+                    usleep(100) //wait until the socket is ready
+                    guard !sOperation.isCancelled else { return }
+                    out -= 100
+                    if out < 0 {
+                        WebSocket.sharedWorkQueue.async {
+                            self?.cleanupStream()
+                        }
+                        self?.doDisconnect(self?.errorWithDetail("write wait timed out", code: 2))
+                        return
+                    } else if outStream.streamError != nil {
+                        return //disconnectStream will be called.
+                    }
+                }
+                guard !sOperation.isCancelled else { return }
+                // Do the pinning now if needed
+                if let sec = s.security, !s.certValidated {
+                    let trust = outStream.property(forKey: kCFStreamPropertySSLPeerTrust as Stream.PropertyKey) as! SecTrust
+                    let domain = outStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as? String
+                    s.certValidated = sec.isValid(trust, domain: domain)
+                    if !s.certValidated {
+                        WebSocket.sharedWorkQueue.async {
+                            let error = s.errorWithDetail("Invalid SSL certificate", code: 1)
+                            s.disconnectStream(error)
+                        }
+                        return
+                    }
+                }
+                outStream.write(bytes, maxLength: data.count)
+            }
+            writeQueue.addOperation(operation)
+        }
+    }
+
+    ///network connected
+    private func didConnect() {
+        updateSecureStreamOptions();
+        let urlRequest = CFHTTPMessageCreateRequest(kCFAllocatorDefault, "GET" as NSString,
+                                                    url as CFURL, kCFHTTPVersion1_1).takeRetainedValue()
+
+        var port = url.port
+        if port == nil {
+            if let scheme = url.scheme, supportedSSLSchemes.contains(scheme) {
+                port = 443
+            } else {
+                port = 80
+            }
+        }
+        addHeader(urlRequest, key: headerWSUpgradeName, val: headerWSUpgradeValue)
+        addHeader(urlRequest, key: headerWSConnectionName, val: headerWSConnectionValue)
+        if let protocols = optionalProtocols {
+            addHeader(urlRequest, key: headerWSProtocolName, val: protocols.joined(separator: ","))
+        }
+        addHeader(urlRequest, key: headerWSVersionName, val: headerWSVersionValue)
+        addHeader(urlRequest, key: headerWSKeyName, val: generateWebSocketKey())
+        if let origin = origin {
+            addHeader(urlRequest, key: headerOriginName, val: origin)
+        }
+        addHeader(urlRequest, key: headerWSHostName, val: "\(url.host!):\(port!)")
+        for (key, value) in headers {
+            addHeader(urlRequest, key: key, val: value)
+        }
+        if let cfHTTPMessage = CFHTTPMessageCopySerializedMessage(urlRequest) {
+            let data: NSData = cfHTTPMessage.takeRetainedValue()
+            let bytes = UnsafeRawPointer((data as NSData).bytes).assumingMemoryBound(to: UInt8.self)
+            var out = timeout * 1_000_000 // wait 5 seconds before giving up
+            let operation = BlockOperation()
+            operation.addExecutionBlock { [weak self, weak operation] in
+                guard let sOperation = operation else { return }
+                guard let s = self else { return }
+                guard let outStream = s.outputStream else { return }
+                while !outStream.hasSpaceAvailable && !sOperation.isCancelled {
+                    usleep(100) //wait until the socket is ready
+                    guard !sOperation.isCancelled else { return }
+                    out -= 100
+                    if out < 0 {
+                        WebSocket.sharedWorkQueue.async {
+                            self?.cleanupStream()
+                        }
+                        self?.doDisconnect(self?.errorWithDetail("write wait timed out", code: 2))
+                        return
+                    } else if outStream.streamError != nil {
+                        return //disconnectStream will be called.
+                    }
+                }
+                guard !sOperation.isCancelled else { return }
+                // Do the pinning now if needed
+                if let sec = s.security, !s.certValidated {
+                    let trust = outStream.property(forKey: kCFStreamPropertySSLPeerTrust as Stream.PropertyKey) as! SecTrust
+                    let domain = outStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as? String
+                    s.certValidated = sec.isValid(trust, domain: domain)
+                    if !s.certValidated {
+                        WebSocket.sharedWorkQueue.async {
+                            let error = s.errorWithDetail("Invalid SSL certificate", code: 1)
+                            s.disconnectStream(error)
+                        }
+                        return
+                    }
+                }
+                outStream.write(bytes, maxLength: data.length)
+            }
+            writeQueue.addOperation(operation)
+        }
+    }
+
+    //handle checking the proxy  connection status
+    private func proxyProcessHTTPResponse(buffer: UnsafePointer<UInt8>, bufferLen: Int) {
+        let code = processProxyHTTP(buffer: buffer, bufferLen: bufferLen)
+        switch code {
+        case 0:
+            connectingToProxy = false
+            didConnect()
+            return;
+        case -1:
+            fragBuffer = Data(bytes: buffer, count: bufferLen)
+        break //do nothing, we are going to collect more data
+        default:
+            doDisconnect(errorWithDetail("Invalid PROXY RESPONSE", code: UInt16(code)))
+        }
+    }
+
+    ///Finds the HTTP Packet in the TCP stream, by looking for the CRLF.
+    private func processProxyHTTP(buffer: UnsafePointer<UInt8>, bufferLen: Int) -> Int {
+        let CRLFBytes = [UInt8(ascii: "\r"), UInt8(ascii: "\n"), UInt8(ascii: "\r"), UInt8(ascii: "\n")]
+        var k = 0
+        var totalSize = 0
+        for i in 0..<bufferLen {
+            if buffer[i] == CRLFBytes[k] {
+                k += 1
+                if k == 3 {
+                    totalSize = i + 1
+                    break
+                }
+            } else {
+                k = 0
+            }
+        }
+        if totalSize > 0 {
+            let code = validateResponseForProxy(buffer: buffer, bufferLen: totalSize)
+            if code != 0 {
+                return code
+            }
+            totalSize += 1 //skip the last \n
+            let restSize = bufferLen - totalSize
+            if restSize > 0 {
+                processRawMessagesInBuffer(buffer + totalSize, bufferLen: restSize)
+            }
+            return 0 //success
+        }
+        return -1 //was unable to find the full TCP header
+    }
+
+    ///validates the HTTP response is <= 200 < 299
+    private func validateResponseForProxy(buffer: UnsafePointer<UInt8>, bufferLen: Int) -> Int {
+        let response = CFHTTPMessageCreateEmpty(kCFAllocatorDefault, false).takeRetainedValue()
+        CFHTTPMessageAppendBytes(response, buffer, bufferLen)
+        let code = CFHTTPMessageGetResponseStatusCode(response)
+        if code > 299 {
+            return code
+        }
+        if code >= 200 {
+            return 0
+        }
+        return -1
+    }
 }
 
 private extension Data {
