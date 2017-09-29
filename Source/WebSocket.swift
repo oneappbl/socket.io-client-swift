@@ -986,7 +986,7 @@ open class WebSocket : NSObject, StreamDelegate {
 
         if let settings = proxies[0] as? NSDictionary,
             let proxyType = settings[(kCFProxyTypeKey as NSString)] as? NSString {
-            switch (proxyType) {
+            switch (proxyType as CFString) {
             case kCFProxyTypeAutoConfigurationURL:
                 if let pacURL: NSURL = settings[(kCFProxyAutoConfigurationURLKey as NSString)] as? NSURL {
                     fetchPAC(PACurl: pacURL as URL)
@@ -1005,7 +1005,7 @@ open class WebSocket : NSObject, StreamDelegate {
     }
 
     private func readProxySetting(proxyType: NSString, settings: NSDictionary ){
-        switch (proxyType) {
+        switch (proxyType as CFString) {
         case kCFProxyTypeHTTP, kCFProxyTypeHTTPS:
             httpProxyHost = settings[(kCFProxyHostNameKey as NSString)] as? String
             if let portValue = settings[(kCFProxyPortNumberKey as NSString)] as? NSNumber {
